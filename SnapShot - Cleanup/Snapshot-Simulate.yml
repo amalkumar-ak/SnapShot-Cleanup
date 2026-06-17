@@ -1,0 +1,262 @@
+# =====================================================================
+# SnapShot-Simulate.yml
+# ---------------------------------------------------------------------
+# Friday "preview" pipeline. Runs the SnapShot-CleanUp.ps1 worker in
+# simulation mode against every configured Azure landing zone, merges
+# the per-LZ CSVs, publishes them as a build artifact, and emails the
+# consolidated report so snapshot owners can opt out by tagging
+# DoNotDelete=True before the real cleanup the next day.
+#
+# This pipeline never deletes snapshots.
+# =====================================================================
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "0 8 * * 5"
+    displayName: "Run every Friday 9 AM (UTC 1)"
+    branches:
+      include:
+        - main
+    always: true
+
+parameters:
+
+  - name: landingZones
+    displayName: "Azure Landing Zones"
+    type: object
+    default:
+      # - lz-sandbox
+      # - lz-dev
+      # - lz-test
+      # - lz-prod
+        - Azure subscription 1
+  - name: simulate
+    displayName: "Simulation Mode"
+    type: boolean
+    default: true
+
+variables:
+  # Snapshots older than this (in days) are flagged in the simulation.
+  # Keep this <= olderThanDays in SnapShot-Cleanup.yml so anything
+  # previewed on Friday is still eligible on Saturday.
+  olderThanDays: 14
+
+  # Report folder
+  reportFolder: '$(Build.ArtifactStagingDirectory)/snapshot-reports'
+
+  # SMTP Settings - replace with your own SMTP relay before running.
+  smtpServer: 'smtp.example.com'
+  smtpPort:   '25'
+  mailFrom:   'no-reply@example.com'
+  mailTo:     'ops-team@example.com'
+
+stages:
+
+# =====================================================================
+# Snapshot Cleanup Stage
+# =====================================================================
+- stage: SnapshotCleanup
+  displayName: "Snapshot Cleanup Stage"
+
+  jobs:
+
+  - job: CleanupJob
+    displayName: "Run Cleanup Across Landing Zones"
+
+    pool:
+      # Replace with the agent pool name available in your Azure DevOps
+      # organisation (e.g. "Default", "Azure Pipelines", or a self-hosted
+      # pool name).
+      name: Default
+
+    steps:
+
+    # =================================================================
+    # Checkout Repository
+    # =================================================================
+    - checkout: self
+
+    # =================================================================
+    # Create Report Folder
+    # =================================================================
+    - task: PowerShell@2
+      displayName: "Create Report Folder"
+
+      inputs:
+        targetType: inline
+        script: |
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "$(reportFolder)"
+
+    # =================================================================
+    # Loop Through Landing Zones
+    # =================================================================
+    - ${{ each lz in parameters.landingZones }}:
+
+      - task: AzurePowerShell@5
+        displayName: "Cleanup Snapshots - ${{ lz }}"
+
+        inputs:
+
+          # Service connection naming convention: sc-<landing-zone>
+          # Create one Azure DevOps service connection per landing zone.
+          azureSubscription: 'sc-${{ lz }}'
+          ScriptType: 'FilePath'
+          ScriptPath: 'scripts/SnapShot-CleanUp.ps1'
+          ScriptArguments: >
+            -ResourceGroup "rg-snap-${{ lz }}"
+            -LandingZone "${{ lz }}"
+            -OlderThanDays $(olderThanDays)
+            -Simulate $${{ parameters.simulate }}
+            -ReportPath "$(reportFolder)/${{ lz }}.csv"
+
+          azurePowerShellVersion: 'LatestVersion'
+
+    # =================================================================
+    # Merge CSV Reports
+    # =================================================================
+    - task: PowerShell@2
+      displayName: "Merge CSV Reports"
+
+      inputs:
+        targetType: inline
+        script: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "==================================="
+          Write-Host "Merging CSV Reports"
+          Write-Host "==================================="
+
+          $files = Get-ChildItem `
+            -Path "$(reportFolder)" `
+            -Filter *.csv
+
+          if ($files.Count -eq 0) {
+              throw "No CSV files found."
+          }
+
+          $all = foreach ($file in $files) {
+
+              Write-Host "Importing: $($file.FullName)"
+
+              Import-Csv $file.FullName
+          }
+
+          $finalReport = "$(reportFolder)/SnapshotCleanupReport.csv"
+
+          $all | Export-Csv `
+            -Path $finalReport `
+            -NoTypeInformation
+
+          Write-Host ""
+          Write-Host "Consolidated report created:"
+          Write-Host $finalReport
+          Write-Host ""
+
+          # Summary
+          Write-Host "==================================="
+          Write-Host "Summary"
+          Write-Host "==================================="
+
+          $summary = $all | Group-Object Status
+
+          foreach ($item in $summary) {
+
+              Write-Host "$($item.Name) : $($item.Count)"
+          }
+
+    # =================================================================
+    # Publish Artifact
+    # =================================================================
+    - publish: $(reportFolder)
+      artifact: SnapshotReports
+
+    # =================================================================
+    # Send Email Report
+    # =================================================================
+    - task: PowerShell@2
+      displayName: "Send Email Report"
+
+      inputs:
+        targetType: inline
+        script: |
+
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "==================================="
+          Write-Host "Preparing Email"
+          Write-Host "==================================="
+
+          $reportFile = "$(reportFolder)/SnapshotCleanupReport.csv"
+
+          if (!(Test-Path $reportFile)) {
+              throw "Report file not found: $reportFile"
+          }
+
+          $data = Import-Csv $reportFile
+
+          $summary = $data | Group-Object Status | ForEach-Object {
+              "$($_.Name): $($_.Count)"
+          }
+
+          $summaryText = $summary -join "`r`n"
+
+          if ("${{ parameters.simulate }}" -eq "true") {
+              $subject = "[SIMULATION] Snapshot Cleanup Report"
+              $body = @(
+                  "Hello,",
+                  "",
+                  "Please find attached the simulation report for Snapshot Cleanup.",
+                  "",
+                  "If any snapshots should be excluded from cleanup, please update the snapshot tag as follows:",
+                  "",
+                  "DoNotDelete = True",
+                  "",
+                  "Summary:",
+                  "$summaryText",
+                  "",
+                  "Regards,",
+                  "Cloud Operations Team"
+              ) -join "`r`n"
+          }
+          else {
+              $subject = "Snapshot Cleanup Report"
+              $body = @(
+                  "Hello,",
+                  "",
+                  "Please find attached the consolidated snapshot cleanup report.",
+                  "",
+                  "Summary:",
+                  "$summaryText",
+                  "",
+                  "Regards,",
+                  "Cloud Operations Team"
+              ) -join "`r`n"
+          }
+
+          Write-Host ""
+          Write-Host "Sending Email..."
+          Write-Host ""
+
+          $mailParams = @{
+              From        = "$(mailFrom)"
+              To          = "$(mailTo)"
+              Subject     = $subject
+              Body        = $body
+              SmtpServer  = "$(smtpServer)"
+              Port        = "$(smtpPort)"
+              Attachments = $reportFile
+          }
+
+          Send-MailMessage @mailParams
+
+          Write-Host ""
+          Write-Host "==================================="
+          Write-Host "Email Sent Successfully"
+          Write-Host "==================================="
