@@ -60,14 +60,6 @@ azure-snapshot-cleanup/
 │   └── SnapShot-Cleanup.yml    # Saturday — real cleanup pipeline
 ├── scripts/
 │   └── SnapShot-CleanUp.ps1    # Per-LZ worker (called by both pipelines)
-├── tests/
-│   └── Mock-Simulate.ps1       # Offline simulation harness (no Azure required)
-├── docs/
-│   ├── generate_pdf.py
-│   └── SnapShot-Cleanup-Documentation.pdf   # Detailed technical doc
-├── .gitignore
-├── CONTRIBUTING.md
-├── LICENSE                     # MIT
 └── README.md
 ```
 
